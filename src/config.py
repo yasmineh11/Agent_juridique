@@ -3,8 +3,6 @@
 config.py - Configuration centrale du projet
 ============================================================
 
-Ce fichier centralise TOUTES les constantes et paramètres.
-L'avantage : modifier un seul endroit pour changer tout le comportement.
 
 Principe de conception : séparation configuration / logique.
 """
@@ -20,7 +18,7 @@ load_dotenv()
 # PARAMÈTRES LLM
 # ─────────────────────────────────────────────
 
-# Modèle Groq utilisé - Llama 3 70B est le plus puissant disponible gratuitement
+# Modèle Groq utilisé - Llama 3 70B 
 LLM_MODEL = "llama3-70b-8192"
 
 # Température = créativité du modèle
@@ -30,7 +28,7 @@ LLM_MODEL = "llama3-70b-8192"
 LLM_TEMPERATURE = 0.1
 
 # Nombre maximum de tokens générés par réponse
-# 2048 tokens ≈ environ 1500 mots - amplement suffisant pour une réponse juridique
+# 2048 tokens ≈ environ 1500 mots 
 LLM_MAX_TOKENS = 2048
 
 # ─────────────────────────────────────────────
@@ -39,7 +37,7 @@ LLM_MAX_TOKENS = 2048
 
 # Nombre maximum d'itérations de la boucle Thought → Action → Observation
 # Si l'agent n'a pas trouvé de réponse après 6 itérations, il s'arrête
-# Évite les boucles infinies et contrôle les coûts d'API
+
 AGENT_MAX_ITERATIONS = 6
 
 # Nombre d'échanges conservés en mémoire (5 derniers tours)
@@ -68,7 +66,6 @@ TOP_K_RESULTS = 3
 
 # Modèle d'embeddings multilingue de HuggingFace
 # "paraphrase-multilingual-MiniLM-L12-v2" supporte 50+ langues dont fr et ar
-# Téléchargé automatiquement au premier lancement (~130 Mo)
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
 # ─────────────────────────────────────────────
@@ -90,7 +87,7 @@ CHUNK_OVERLAP = 100
 # ─────────────────────────────────────────────
 
 # Répertoire contenant les PDFs tunisiens à ingérer
-PDF_DIR = os.getenv("PDF_DIR", "./data")
+PDF_DIR = os.getenv("PDF_DIR", "Agent/data")
 
 # ─────────────────────────────────────────────
 # SEUIL DE CONFIANCE (pour le fallback web)
