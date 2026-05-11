@@ -19,7 +19,10 @@ load_dotenv()
 model = SentenceTransformer(
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
-chroma_client = chromadb.PersistentClient(path="./vectorstore")
+from config import CHROMA_DB_PATH, COLLECTION_NAME
+
+chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
 collection = chroma_client.get_or_create_collection("lois_tunisiennes")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AgentJuridiqueTN/1.0)"}

@@ -87,7 +87,7 @@ CHUNK_OVERLAP = 100
 # ─────────────────────────────────────────────
 
 # Répertoire contenant les PDFs tunisiens à ingérer
-PDF_DIR = os.getenv("PDF_DIR", "Agent/data")
+PDF_DIR = os.getenv("PDF_DIR", "./data")
 
 # ─────────────────────────────────────────────
 # SEUIL DE CONFIANCE (pour le fallback web)
