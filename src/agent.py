@@ -1,14 +1,16 @@
 # src/agent.py
 import os
 import sys
+import datetime
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-
+from langchain_core.messages import HumanMessage, SystemMessage
+from config import LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, AGENT_MAX_ITERATIONS
 from tools import (
     search_legal_docs,
     web_search_jort,
@@ -20,8 +22,9 @@ load_dotenv()
 
 # ── LLM ──────────────────────────────────────────────────────────
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0.1,
+    model=LLM_MODEL,
+    temperature=LLM_TEMPERATURE,
+    max_tokens=LLM_MAX_TOKENS,
     api_key=os.getenv("GROQ_API_KEY")
 )
 
@@ -33,41 +36,40 @@ tools = [
     analyze_document
 ]
 
-# ── Prompt système ───────────────────────────────────────────────
-SYSTEM_PROMPT = """Tu es un assistant juridique expert en droit tunisien.
-Tu aides les citoyens tunisiens a comprendre leurs droits de facon
-simple et claire, en citant toujours tes sources.
+# ── Prompt système ────────────────────────────────────────────────
+_today = datetime.date.today().strftime("%d %B %Y")
 
-REGLES OBLIGATOIRES :
-1. Appelle TOUJOURS search_legal_docs EN PREMIER
-2. Si search_legal_docs retourne CONFIANCE_FAIBLE
-   → appelle immediatement web_search_jort
-3. Si la question est en arabe
-   → appelle translate_legal_text apres la recherche
-4. Si l'utilisateur joint un document
-   → appelle analyze_document avant tout
-5. Cite TOUJOURS l'article exact et la source
-6. Si aucun outil ne trouve → dis-le clairement, sans inventer
-7. Reponds en francais sauf si l'utilisateur ecrit en arabe
+SYSTEM_PROMPT = (
+    f"You are a Tunisian legal assistant. Today: {_today}. "
+    "Always use tools. Never answer from memory alone. "
+    "Rules: (1) Always call search_legal_docs first. "
+    "(2) If it returns CONFIANCE_FAIBLE, call web_search_jort. "
+    "(3) If user uploads a document, call analyze_document first. "
+    "(4) If question is in Arabic, call translate_legal_text after searching. "
+    "(5) Always cite the exact article and source. "
+    "(6) Reply in French unless the user writes in Arabic. "
+    "(7) You are not a lawyer. Answers are informational only."
+)
 
-IMPORTANT : tu n'es pas un avocat. Tes reponses sont
-informatives uniquement."""
-
-# ── Memoire ───────────────────────────────────────────────────────
+# ── Mémoire ───────────────────────────────────────────────────────
 memory = MemorySaver()
 
-# ── Agent LangGraph 0.2.x ────────────────────────────────────────
+# ── Agent ─────────────────────────────────────────────────────────
+# 'prompt' was renamed to 'state_modifier' in langgraph >= 0.2.x
 agent_executor = create_react_agent(
     model=llm,
     tools=tools,
     state_modifier=SYSTEM_PROMPT,
-    checkpointer=memory
+    checkpointer=memory,
 )
 
 
 # ── Fonction principale ───────────────────────────────────────────
 def ask_agent(question: str, thread_id: str = "default") -> str:
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": AGENT_MAX_ITERATIONS * 3,
+    }
     try:
         result = agent_executor.invoke(
             {"messages": [HumanMessage(content=question)]},
@@ -80,14 +82,12 @@ def ask_agent(question: str, thread_id: str = "default") -> str:
 
 # ── Test direct ───────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("Agent pret — langgraph 0.2.60 + llama-3.3-70b-versatile")
+    print(f"Agent pret — {LLM_MODEL}")
     print("=" * 55)
-
     questions = [
         "Quels sont mes droits en cas de licenciement sans preavis ?",
         "Et quel est le delai pour contester ?"
     ]
-
     for q in questions:
         print(f"\nQuestion : {q}")
         print(f"Reponse  : {ask_agent(q)}")

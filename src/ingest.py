@@ -58,17 +58,12 @@ def extraire_texte_pdf(chemin_pdf: str) -> list[dict]:
     nom_fichier = Path(chemin_pdf).stem  # Nom sans extension
 
     try:
-        # Ouvre le PDF avec PyMuPDF
         doc = fitz.open(chemin_pdf)
 
         for numero_page in range(len(doc)):
             page = doc[numero_page]
-
-            # Extrait le texte avec préservation des espaces
-            # Le flag TEXT_PRESERVE_WHITESPACE aide pour l'arabe
             texte = page.get_text("text")
 
-            # Ignore les pages vides ou presque vides (< 50 caractères)
             if len(texte.strip()) > 50:
                 pages.append({
                     "texte": texte.strip(),
@@ -110,19 +105,20 @@ def decouper_en_fragments(pages: list[dict]) -> list[dict]:
     Returns:
         Liste de fragments avec métadonnées enrichies
     """
-    # Configure le découpage
-    # Les séparateurs reproduisent la structure des codes de loi tunisiens
-    # qui utilisent généralement "Article X" sur une nouvelle ligne
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=[
-            "\nArticle",     # Coupe prioritairement aux articles de loi
-            "\nاﻟﻤﺎدة",      # Coupe aux articles en arabe
-            "\n\n",          # Puis aux paragraphes
-            "\n",            # Puis aux lignes
-            ".",             # Puis aux phrases
-            " ",             # En dernier recours
+            "\nArticle",      # Coupe prioritairement aux articles de loi (français)
+            # FIX: the original separator used Arabic Presentation Forms (U+FE80
+            # range), which are rarely used in modern PDFs. Replaced with standard
+            # Unicode Arabic (U+0627 + U+0644 + U+0645 + U+0627 + U+062F + U+0629)
+            # so the splitter actually matches article headings in source PDFs.
+            "\nالمادة",       # Coupe aux articles en arabe (Unicode standard)
+            "\n\n",           # Puis aux paragraphes
+            "\n",             # Puis aux lignes
+            ".",              # Puis aux phrases
+            " ",              # En dernier recours
         ],
         length_function=len,
     )
@@ -130,11 +126,9 @@ def decouper_en_fragments(pages: list[dict]) -> list[dict]:
     fragments = []
 
     for page_info in pages:
-        # Découpe le texte de cette page
         morceaux = splitter.split_text(page_info["texte"])
 
         for i, morceau in enumerate(morceaux):
-            # Ignore les fragments trop courts (probablement des en-têtes)
             if len(morceau.strip()) < 30:
                 continue
 
@@ -143,8 +137,10 @@ def decouper_en_fragments(pages: list[dict]) -> list[dict]:
                 "source": page_info["source"],
                 "page": page_info["page"],
                 "fragment_id": i,
-                # Métadonnée utile : détecte si le fragment contient un numéro d'article
-                "contient_article": "article" in morceau.lower() or "اﻟﻤﺎدة" in morceau,
+                "contient_article": (
+                    "article" in morceau.lower() or
+                    "المادة" in morceau  # FIX: normalised Arabic
+                ),
             })
 
     return fragments
@@ -161,7 +157,7 @@ def stocker_dans_chromadb(fragments: list[dict]) -> chromadb.Collection:
     Que sont les embeddings (vecteurs) ?
     - Chaque fragment de texte est transformé en un tableau de ~384 nombres
     - Deux textes sémantiquement proches → vecteurs proches dans l'espace
-    - Exemple : "licenciement abusif" et "rupture injustifiée du contrat" 
+    - Exemple : "licenciement abusif" et "rupture injustifiée du contrat"
       auront des vecteurs proches → même résultat de recherche
 
     ChromaDB stocke :
@@ -177,52 +173,39 @@ def stocker_dans_chromadb(fragments: list[dict]) -> chromadb.Collection:
     """
     print("\n🔧 Initialisation de ChromaDB...")
 
-    # Client persistant = les données survivent aux redémarrages
     client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
-    # Fonction d'embedding : convertit texte → vecteur
-    # SentenceTransformer est téléchargé automatiquement depuis HuggingFace
     embedding_function = SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL
     )
 
-    # Supprime l'ancienne collection si elle existe (mode réingestion)
     try:
         client.delete_collection(COLLECTION_NAME)
         print(f"  🗑️  Ancienne collection '{COLLECTION_NAME}' supprimée")
     except Exception:
-        pass  # Pas d'erreur si la collection n'existait pas
+        pass
 
-    # Crée la nouvelle collection
     collection = client.create_collection(
         name=COLLECTION_NAME,
         embedding_function=embedding_function,
-        metadata={"hnsw:space": "cosine"},  # Distance cosinus = meilleure pour le texte
+        metadata={"hnsw:space": "cosine"},
     )
 
     print(f"  📦 Vectorisation de {len(fragments)} fragments...")
     print("  ⏳ (première exécution : téléchargement du modèle d'embeddings ~130Mo)")
 
-    # Insertion par lots de 100 (évite les timeouts pour de grandes collections)
     BATCH_SIZE = 100
     for debut in range(0, len(fragments), BATCH_SIZE):
         lot = fragments[debut:debut + BATCH_SIZE]
 
         collection.add(
-            # Identifiants uniques pour chaque fragment
             ids=[f"{f['source']}_p{f['page']}_f{f['fragment_id']}" for f in lot],
-
-            # Le texte brut (stocké pour être retourné dans les résultats)
             documents=[f["texte"] for f in lot],
-
-            # Métadonnées filtrables (peuvent être utilisées dans les requêtes)
             metadatas=[{
                 "source": f["source"],
                 "page": f["page"],
                 "contient_article": str(f["contient_article"]),
             } for f in lot],
-            # Note: ChromaDB vectorise automatiquement les documents
-            # en utilisant l'embedding_function définie à la création
         )
 
         print(f"  ✅ Lot {debut // BATCH_SIZE + 1} ingéré ({min(debut + BATCH_SIZE, len(fragments))}/{len(fragments)})")
@@ -243,7 +226,6 @@ def main():
     print("  GUIDE JURIDIQUE TUNISIEN - Ingestion des documents")
     print("=" * 60)
 
-    # Vérification du répertoire de données
     if not os.path.exists(PDF_DIR):
         os.makedirs(PDF_DIR)
         print(f"\n📁 Répertoire '{PDF_DIR}' créé.")
@@ -253,7 +235,6 @@ def main():
         print("   https://legislation.tn/")
         return
 
-    # Trouve tous les PDFs
     pdfs = list(Path(PDF_DIR).glob("*.pdf"))
 
     if not pdfs:
@@ -265,7 +246,6 @@ def main():
     for pdf in pdfs:
         print(f"   - {pdf.name}")
 
-    # Étape 1 : Extraction du texte
     print("\n📖 Étape 1/3 : Extraction du texte...")
     toutes_les_pages = []
     for pdf in pdfs:
@@ -274,21 +254,18 @@ def main():
 
     print(f"   Total : {len(toutes_les_pages)} pages extraites")
 
-    # Étape 2 : Découpage en fragments
     print("\n✂️  Étape 2/3 : Découpage en fragments...")
     fragments = decouper_en_fragments(toutes_les_pages)
     print(f"   Total : {len(fragments)} fragments créés")
 
-    # Étape 3 : Vectorisation et stockage
     print("\n🧠 Étape 3/3 : Vectorisation et stockage...")
     collection = stocker_dans_chromadb(fragments)
 
-    # Vérification finale
     count = collection.count()
     print(f"\n{'=' * 60}")
     print(f"  ✅ INGESTION TERMINÉE : {count} fragments indexés")
     print(f"  📂 Base vectorielle : {CHROMA_DB_PATH}")
-    print(f"  🚀 Lancez maintenant : python app.py")
+    print(f"  🚀 Lancez maintenant : python gradio_app.py")
     print("=" * 60)
 
 

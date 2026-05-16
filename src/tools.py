@@ -6,26 +6,41 @@
 # ═══════════════════════════════════════════════════════════════════
 
 import chromadb
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
 from langchain_core.tools import tool
-from sentence_transformers import SentenceTransformer
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from dotenv import load_dotenv
+from scraper import fetch_9anoun_code, fetch_9anoun_jort
 
 load_dotenv()
 
+from config import CHROMA_DB_PATH, COLLECTION_NAME, EMBEDDING_MODEL
+
 # ── Initialisation globale (une seule fois au démarrage) ──────────
-model = SentenceTransformer(
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-)
-from config import CHROMA_DB_PATH, COLLECTION_NAME
+# FIX: use SentenceTransformerEmbeddingFunction (same as ingest.py) so that
+# query vectors use the exact same normalisation as the stored vectors.
+# The previous code used a bare SentenceTransformer + manual .encode(),
+# which produced different vector scales → wrong similarity scores.
+embedding_fn = SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
-collection = chroma_client.get_or_create_collection("lois_tunisiennes")
+# FIX: pass embedding_function when opening the collection so ChromaDB uses
+# our model at query time instead of its own default embedder.
+collection = chroma_client.get_or_create_collection(
+    COLLECTION_NAME,
+    embedding_function=embedding_fn
+)
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AgentJuridiqueTN/1.0)"}
+# ── Translation pipeline cache (loaded once, not on every call) ───
+_translation_pipelines: dict = {}
+
+
+def _get_translation_pipeline(model_name: str):
+    """Lazy-load and cache HuggingFace translation pipelines."""
+    if model_name not in _translation_pipelines:
+        from transformers import pipeline as hf_pipeline
+        _translation_pipelines[model_name] = hf_pipeline("translation", model=model_name)
+    return _translation_pipelines[model_name]
+
 
 # ═══════════════════════════════════════════════════════════════════
 # OUTIL 1 — Recherche locale dans ChromaDB
@@ -48,17 +63,16 @@ def search_legal_docs(query: str) -> str:
         CONFIANCE_FAIBLE qui déclenchera web_search_jort.
     """
     try:
-        # Vectoriser la question
-        emb = model.encode(query).tolist()
-
-        # Recherche dans ChromaDB
+        # FIX: use query_texts instead of manually encoding with a separate
+        # SentenceTransformer instance. The collection's own embedding_function
+        # (set at init above) handles vectorisation, guaranteeing consistency
+        # with the vectors stored during ingest.py.
         results = collection.query(
-            query_embeddings=[emb],
+            query_texts=[query],
             n_results=4,
             include=["documents", "metadatas", "distances"]
         )
 
-        # Vérifier si des résultats existent
         if not results["documents"] or not results["documents"][0]:
             return (
                 "CONFIANCE_FAIBLE (0%) — "
@@ -66,13 +80,12 @@ def search_legal_docs(query: str) -> str:
                 "Utiliser web_search_jort."
             )
 
-        # Calculer le score de confiance du meilleur résultat
-        # ChromaDB retourne une distance (0=identique, 2=opposé)
-        # On la convertit en pourcentage de confiance
         best_distance = results["distances"][0][0]
-        confidence = round((1 - best_distance / 2) * 100)
+        # FIX: cosine distance from sentence-transformers is in [0, 1] for
+        # normalised vectors. Correct formula is (1 - distance), not
+        # (1 - distance/2) which capped the maximum confidence at 50%.
+        confidence = round((1 - best_distance) * 100)
 
-        # Seuil de confiance : si < 40% → signal fallback
         if confidence < 40:
             return (
                 f"CONFIANCE_FAIBLE ({confidence}%) — "
@@ -80,14 +93,13 @@ def search_legal_docs(query: str) -> str:
                 f"Utiliser web_search_jort pour chercher en ligne."
             )
 
-        # Formater les résultats avec sources et scores
         output = []
         for doc, meta, dist in zip(
             results["documents"][0],
             results["metadatas"][0],
             results["distances"][0]
         ):
-            score = round((1 - dist / 2) * 100)
+            score = round((1 - dist) * 100)  # FIX: same corrected formula
             source = meta.get("source", "Source inconnue")
             article = meta.get("article", "")
             ref = f"{source}" + (f" — {article}" if article else "")
@@ -105,242 +117,43 @@ def search_legal_docs(query: str) -> str:
 @tool
 def web_search_jort(keywords: str) -> str:
     """
-    Recherche les lois et décrets tunisiens récents sur deux sources :
+    Recherche les lois et décrets tunisiens récents sur 9anoun.tn,
+    qui héberge à la fois les codes juridiques ET toutes les éditions
+    du Journal Officiel de la République Tunisienne (JORT).
 
-      1. iort.gov.tn  — Journal Officiel de la République Tunisienne
-                        Source officielle de toutes les lois promulguées.
+    Sources utilisées (toutes via 9anoun.tn, HTML statique, sans JS) :
+      1. https://9anoun.tn/kb/codes/{slug}  — code juridique correspondant
+         aux mots-clés (code du travail, code pénal, COC, etc.)
+      2. https://9anoun.tn/kb/jorts         — dernières éditions du JORT
 
-      2. 9anoun.tn    — Codes juridiques tunisiens en arabe, mis à jour
-                        Contient : Code du Travail, Code Pénal, Code des
-                        Obligations, Code de Commerce, Code Fiscal,
-                        Code de Procédure Civile, Code des Douanes,
-                        Code des Droits Réels, Code Maritime, JORT.
+    Note : iort.gov.tn utilise une application WinDev avec navigation
+    en javascript:{} et tokens de session — impossible à interroger
+    automatiquement. 9anoun.tn est le miroir officiel utilisé à la place.
 
     RÈGLE D'UTILISATION :
       - Appeler UNIQUEMENT si search_legal_docs retourne CONFIANCE_FAIBLE
-      - Ou si la question porte sur une loi très récente (2024-2025)
+      - Ou si la question porte sur une loi très récente
       - Ne JAMAIS appeler avant search_legal_docs
     """
-
     results = []
 
-    # ── SOURCE 1 : JORT officiel (iort.gov.tn) ───────────────────
-    try:
-        jort_url = (
-            f"https://www.google.com/search"
-            f"?q={requests.utils.quote(keywords)}+site:iort.gov.tn"
+    # ── SOURCE 1 : Code juridique sur 9anoun.tn ───────────────────
+    code_content, code_url = fetch_9anoun_code(keywords)
+    if code_content:
+        results.append(
+            f"[Source : 9anoun.tn — Codes | {code_url}]\n{code_content}"
         )
-        resp = requests.get(jort_url, headers=HEADERS, timeout=8)
-        soup = BeautifulSoup(resp.text, "html.parser")
+    else:
+        results.append("[9anoun.tn codes : aucun contenu trouvé]")
 
-        # Extraire les snippets Google
-        snippets = [
-            g.get_text()
-            for g in soup.find_all("div", class_="BNeawe")[:4]
-            if len(g.get_text()) > 40
-        ]
-
-        if snippets:
-            results.append(
-                "[Source : JORT — iort.gov.tn]\n" +
-                "\n\n".join(snippets)
-            )
-        else:
-            # Tentative directe sur le site JORT
-            direct = requests.get(
-                f"https://www.iort.gov.tn/SITEIORT_WEB/",
-                headers=HEADERS, timeout=6
-            )
-            soup_d = BeautifulSoup(direct.text, "html.parser")
-            paras = [
-                p.get_text().strip()
-                for p in soup_d.find_all("p")
-                if len(p.get_text().strip()) > 50
-            ][:4]
-            if paras:
-                results.append(
-                    "[Source : JORT — iort.gov.tn]\n" +
-                    "\n".join(paras)
-                )
-            else:
-                results.append("[JORT : aucun résultat trouvé]")
-
-    except Exception as e:
-        results.append(f"[JORT inaccessible : {str(e)}]")
-
-    # ── SOURCE 2 : 9anoun.tn ─────────────────────────────────────
-    # Mapping complet mots-clés → slug du code sur 9anoun.tn
-    CODE_MAP = {
-        # ── Code du Travail ──
-        "شغل":              "code-travail-proposition-amendements-2025",
-        "travail":           "code-travail-proposition-amendements-2025",
-        "licenciement":      "code-travail-proposition-amendements-2025",
-        "preavis":           "code-travail-proposition-amendements-2025",
-        "préavis":           "code-travail-proposition-amendements-2025",
-        "salaire":           "code-travail-proposition-amendements-2025",
-        "conge":             "code-travail-proposition-amendements-2025",
-        "congé":             "code-travail-proposition-amendements-2025",
-        "contrat travail":   "code-travail-proposition-amendements-2025",
-        "heures travail":    "code-travail-proposition-amendements-2025",
-        "syndicat":          "code-travail-proposition-amendements-2025",
-        "greve":             "code-travail-proposition-amendements-2025",
-        "grève":             "code-travail-proposition-amendements-2025",
-        "indemnite":         "code-travail-proposition-amendements-2025",
-        "indemnité":         "code-travail-proposition-amendements-2025",
-
-        # ── Code des Obligations et Contrats ──
-        "عقود":              "code-obligations-contrats",
-        "التزامات":          "code-obligations-contrats",
-        "obligations":       "code-obligations-contrats",
-        "contrat":           "code-obligations-contrats",
-        "loyer":             "code-obligations-contrats",
-        "bail":              "code-obligations-contrats",
-        "responsabilite":    "code-obligations-contrats",
-        "responsabilité":    "code-obligations-contrats",
-        "dommages":          "code-obligations-contrats",
-        "vente":             "code-obligations-contrats",
-
-        # ── Code de Commerce ──
-        "تجاري":             "code-commerce",
-        "commerce":          "code-commerce",
-        "societe":           "code-commerce",
-        "société":           "code-commerce",
-        "faillite":          "code-commerce",
-        "liquidation":       "code-commerce",
-        "cheque":            "code-commerce",
-        "chèque":            "code-commerce",
-        "facture":           "code-commerce",
-
-        # ── Code Fiscal / Impôts ──
-        "ضريبة":             "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-        "جباية":             "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-        "impot":             "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-        "impôt":             "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-        "fiscal":            "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-        "taxe":              "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-        "tva":               "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-        "declaration":       "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-        "déclaration":       "code-impot-sur-revenu-personnes-physiques-impot-sur-les-societes",
-
-        # ── Code de Procédure Civile ──
-        "مرافعات":           "code-procedure-civile-commerciale",
-        "procedure":         "code-procedure-civile-commerciale",
-        "procédure":         "code-procedure-civile-commerciale",
-        "delai":             "code-procedure-civile-commerciale",
-        "délai":             "code-procedure-civile-commerciale",
-        "recours":           "code-procedure-civile-commerciale",
-        "tribunal":          "code-procedure-civile-commerciale",
-        "jugement":          "code-procedure-civile-commerciale",
-        "appel":             "code-procedure-civile-commerciale",
-        "cassation":         "code-procedure-civile-commerciale",
-        "execution":         "code-procedure-civile-commerciale",
-        "exécution":         "code-procedure-civile-commerciale",
-
-        # ── Code des Douanes ──
-        "douane":            "code-douanes",
-        "ديوانة":            "code-douanes",
-        "importation":       "code-douanes",
-        "exportation":       "code-douanes",
-        "dedouanement":      "code-douanes",
-        "dédouanement":      "code-douanes",
-
-        # ── Code des Collectivités Locales ──
-        "بلدية":             "code-collectivites-locales",
-        "local":             "code-collectivites-locales",
-        "municipalite":      "code-collectivites-locales",
-        "municipalité":      "code-collectivites-locales",
-        "commune":           "code-collectivites-locales",
-        "gouvernorat":       "code-collectivites-locales",
-
-        # ── Code de Commerce Maritime ──
-        "بحري":              "code-commerce-maritime",
-        "maritime":          "code-commerce-maritime",
-        "navire":            "code-commerce-maritime",
-        "transport maritime":"code-commerce-maritime",
-
-        # ── Code des Droits Réels ──
-        "عيني":              "code-droits-reels",
-        "propriete":         "code-droits-reels",
-        "propriété":         "code-droits-reels",
-        "immobilier":        "code-droits-reels",
-        "foncier":           "code-droits-reels",
-        "hypotheque":        "code-droits-reels",
-        "hypothèque":        "code-droits-reels",
-
-        # ── Code de Comptabilité Publique ──
-        "comptabilite":      "code-comptabilite-publique",
-        "comptabilité":      "code-comptabilite-publique",
-        "budget":            "code-comptabilite-publique",
-        "finances publiques":"code-comptabilite-publique",
-
-        # ── Code Droit International Privé ──
-        "international":     "code-droit-international-prive",
-        "دولي":              "code-droit-international-prive",
-        "extradition":       "code-droit-international-prive",
-        "nationalite":       "code-droit-international-prive",
-        "nationalité":       "code-droit-international-prive",
-    }
-
-    # Trouver le slug correspondant aux mots-clés
-    slug = None
-    kw_lower = keywords.lower()
-    for key, val in CODE_MAP.items():
-        if key.lower() in kw_lower:
-            slug = val
-            break
-
-    # URL cible sur 9anoun.tn
-    target_url = (
-        f"https://9anoun.tn/kb/codes/{slug}"
-        if slug
-        else "https://9anoun.tn/kb/codes"
-    )
-
-    try:
-        resp9 = requests.get(target_url, headers=HEADERS, timeout=8)
-        soup9 = BeautifulSoup(resp9.text, "html.parser")
-
-        # Extraire les paragraphes utiles (> 50 caractères)
-        paras = [
-            p.get_text().strip()
-            for p in soup9.find_all("p")
-            if len(p.get_text().strip()) > 50
-        ]
-        content = "\n\n".join(paras[:6])
-
-        if content:
-            results.append(
-                f"[Source : 9anoun.tn | {target_url}]\n{content}"
-            )
-        else:
-            # Fallback Google limité à 9anoun.tn
-            google_9 = (
-                f"https://www.google.com/search"
-                f"?q={requests.utils.quote(keywords)}+site:9anoun.tn"
-            )
-            resp_g = requests.get(google_9, headers=HEADERS, timeout=8)
-            soup_g = BeautifulSoup(resp_g.text, "html.parser")
-            snips = [
-                g.get_text()
-                for g in soup_g.find_all("div", class_="BNeawe")[:3]
-                if len(g.get_text()) > 40
-            ]
-            if snips:
-                results.append(
-                    "[Source : 9anoun.tn via Google]\n" +
-                    "\n\n".join(snips)
-                )
-            else:
-                results.append(
-                    f"[9anoun.tn : aucun contenu extrait depuis {target_url}]"
-                )
-
-    except Exception as e:
-        results.append(f"[9anoun.tn inaccessible : {str(e)}]")
-
-    # ── Fusion des deux sources ───────────────────────────────────
-    if not results:
-        return "Aucun résultat trouvé sur JORT ni sur 9anoun.tn."
+    # ── SOURCE 2 : JORT sur 9anoun.tn ────────────────────────────
+    jort_content, jort_url = fetch_9anoun_jort(keywords)
+    if jort_content:
+        results.append(
+            f"[Source : 9anoun.tn — JORT | {jort_url}]\n{jort_content}"
+        )
+    else:
+        results.append("[9anoun.tn JORT : aucun contenu trouvé]")
 
     separator = "\n\n" + "═" * 50 + "\n\n"
     return separator.join(results)
@@ -350,25 +163,34 @@ def web_search_jort(keywords: str) -> str:
 # OUTIL 3 — Traduction arabe ↔ français
 # ═══════════════════════════════════════════════════════════════════
 @tool
-def translate_legal_text(text: str, target_lang: str) -> str:
+def translate_legal_text(input_text: str) -> str:
     """
-    Traduit un texte juridique tunisien entre l'arabe et le français
-    en utilisant Helsinki-NLP (gratuit sur HuggingFace).
+    Traduit un texte juridique tunisien entre l'arabe et le français.
 
-    Paramètres :
-      - text        : le texte à traduire (max 512 caractères par appel)
-      - target_lang : 'fr' pour arabe→français | 'ar' pour français→arabe
+    Format d'entrée OBLIGATOIRE : "direction|texte"
+      - "fr|النص العربي"    → traduit de l'arabe vers le français
+      - "ar|texte français" → traduit du français vers l'arabe
+
+    Exemples :
+      - "fr|الفصل 14 من مجلة الشغل"
+      - "ar|Article 14 du Code du Travail"
 
     Utiliser cet outil quand :
       - L'utilisateur écrit sa question en arabe
       - Un article trouvé est en arabe et l'utilisateur veut le français
-      - L'utilisateur demande explicitement la traduction d'un texte
-      - 9anoun.tn retourne un texte en arabe à traduire
+      - L'utilisateur demande explicitement une traduction
     """
     try:
-        from transformers import pipeline as hf_pipeline
+        if "|" not in input_text:
+            return (
+                "Format invalide. Utiliser : 'fr|texte arabe' ou 'ar|texte français'.\n"
+                "Exemple : 'fr|الفصل 14 من مجلة الشغل'"
+            )
 
-        # Choisir le modèle selon la direction de traduction
+        target_lang, text = input_text.split("|", 1)
+        target_lang = target_lang.strip().lower()
+        text = text.strip()
+
         if target_lang == "fr":
             model_name = "Helsinki-NLP/opus-mt-ar-fr"
             direction = "Arabe → Français"
@@ -376,15 +198,10 @@ def translate_legal_text(text: str, target_lang: str) -> str:
             model_name = "Helsinki-NLP/opus-mt-fr-ar"
             direction = "Français → Arabe"
         else:
-            return (
-                f"Paramètre target_lang invalide : '{target_lang}'. "
-                f"Utiliser 'fr' ou 'ar'."
-            )
+            return f"Direction invalide : '{target_lang}'. Utiliser 'fr' ou 'ar'."
 
-        # Charger le pipeline (mis en cache après le premier appel)
-        pipe = hf_pipeline("translation", model=model_name)
-
-        # Tronquer à 512 caractères pour éviter les erreurs de mémoire
+        # FIX: use cached pipeline — no more per-call model download.
+        pipe = _get_translation_pipeline(model_name)
         text_truncated = text[:512]
         result = pipe(text_truncated)[0]["translation_text"]
 
@@ -395,10 +212,7 @@ def translate_legal_text(text: str, target_lang: str) -> str:
         )
 
     except ImportError:
-        return (
-            "Librairie 'transformers' manquante. "
-            "Lance : pip install transformers"
-        )
+        return "Librairie 'transformers' manquante. Lance : pip install transformers"
     except Exception as e:
         return f"Erreur de traduction : {str(e)}"
 
@@ -435,7 +249,8 @@ def analyze_document(text_content: str) -> str:
         if not text_content or len(text_content.strip()) < 20:
             return "Document vide ou trop court pour être analysé."
 
-        # Nettoyer le texte : supprimer les lignes vides et trop courtes
+        import re
+
         lines = [
             l.strip()
             for l in text_content.split("\n")
@@ -443,22 +258,65 @@ def analyze_document(text_content: str) -> str:
         ]
 
         total_lines = len(lines)
-        # Prendre les 80 premières lignes utiles pour l'analyse
-        preview_lines = lines[:80]
-        preview = "\n".join(preview_lines)
-
-        # Compter les mots et estimer la longueur
         word_count = len(text_content.split())
 
-        return (
-            f"[Document reçu — {total_lines} lignes utiles, "
-            f"~{word_count} mots]\n\n"
-            f"Contenu extrait pour analyse :\n"
-            f"{'─' * 40}\n"
-            f"{preview}\n"
-            f"{'─' * 40}\n"
-            f"{'[...document tronqué — 80 premières lignes]' if total_lines > 80 else ''}"
+        # ── Pre-processing: lightweight structural extraction ──────
+        # Detect party lines (employer, employee, lessor, tenant, company...)
+        party_pattern = re.compile(
+            r"(entre\s*:?|parties?\s*:?|employeur\s*:?|employ[eé]\s*:?|"
+            r"bailleur\s*:?|locataire\s*:?|soci[eé]t[eé]\s*:?|m\.\s|mme\.?\s)",
+            re.IGNORECASE
         )
+        parties = [l for l in lines if party_pattern.search(l)][:5]
+
+        # Detect article/clause headings
+        clause_pattern = re.compile(
+            r"^(article|clause|chapitre|section|titre|فصل|مادة)\s*\d*",
+            re.IGNORECASE
+        )
+        clauses = [l for l in lines if clause_pattern.match(l)][:15]
+
+        # Flag high-risk legal keywords for the LLM to scrutinise
+        risk_keywords = [
+            "non-concurrence", "non concurrence", "clause pénale", "clause penale",
+            "résiliation", "resiliation", "indemnité", "indemnite",
+            "exclusivité", "exclusivite", "période d'essai", "periode d'essai",
+            "nullité", "nullite", "abusif", "irrégulier", "irregulier",
+            "dommages-intérêts", "dommages interets",
+        ]
+        risk_lines = [
+            l for l in lines
+            if any(kw.lower() in l.lower() for kw in risk_keywords)
+        ][:10]
+
+        # ── Build structured output for the LLM ───────────────────
+        sections = [
+            f"[Document reçu — {total_lines} lignes utiles, ~{word_count} mots]",
+        ]
+
+        if parties:
+            sections.append(
+                "PARTIES DÉTECTÉES :\n" + "\n".join(f"  • {p}" for p in parties)
+            )
+        if clauses:
+            sections.append(
+                "CLAUSES / ARTICLES IDENTIFIÉS :\n" + "\n".join(f"  • {c}" for c in clauses)
+            )
+        if risk_lines:
+            sections.append(
+                "⚠️  POINTS DE RISQUE POTENTIELS (à vérifier au regard du droit tunisien) :\n"
+                + "\n".join(f"  • {r}" for r in risk_lines)
+            )
+
+        # FIX: increased from 80 lines to 200 lines so the LLM sees the bulk
+        # of a real contract (gradio_app.py also sends 8000 chars now).
+        preview = "\n".join(lines[:200])
+        sections.append(
+            f"TEXTE COMPLET POUR ANALYSE :\n{'─' * 40}\n{preview}\n{'─' * 40}"
+            + ("\n[...document tronqué — 200 premières lignes]" if total_lines > 200 else "")
+        )
+
+        return "\n\n".join(sections)
 
     except Exception as e:
         return f"Erreur lors de l'analyse du document : {str(e)}"

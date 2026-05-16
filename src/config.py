@@ -19,7 +19,7 @@ load_dotenv()
 # ─────────────────────────────────────────────
 
 # Modèle Groq utilisé - Llama 3 70B 
-LLM_MODEL = "llama3-70b-8192"
+LLM_MODEL = "llama-3.1-8b-instant"
 
 # Température = créativité du modèle
 # 0.0 = déterministe (mêmes réponses aux mêmes questions)
@@ -87,7 +87,8 @@ CHUNK_OVERLAP = 100
 # ─────────────────────────────────────────────
 
 # Répertoire contenant les PDFs tunisiens à ingérer
-PDF_DIR = os.getenv("PDF_DIR", "./data")
+
+PDF_DIR = os.getenv("PDF_DIR", "./Agent/data")
 
 # ─────────────────────────────────────────────
 # SEUIL DE CONFIANCE (pour le fallback web)
