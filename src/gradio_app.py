@@ -17,11 +17,10 @@ def extraire_texte_pdf(file_path: str) -> str:
         doc = fitz.open(file_path)
         texte = "".join(page.get_text() for page in doc)
         doc.close()
-        # FIX: increased from 3000 to 8000 chars.
-        # 3000 chars ≈ 1.5 pages — most real contracts would be truncated
-        # to the cover page only, making analyze_document nearly useless.
-        # 8000 chars ≈ 5-6 pages, sufficient for most employment contracts.
-        return texte[:8000]
+        # FIX: reduced from 8000 to 2000 chars to stay within Groq free
+        # tier TPM limit (6000 tokens/min). The scraper also adds ~2000
+        # chars of legal context, so 2000 chars of PDF leaves enough headroom.
+        return texte[:2000]
     except Exception as e:
         return f"[Erreur PDF : {str(e)}]"
 
@@ -32,7 +31,13 @@ def repondre(message, history, file, thread_id):
 
     if file is not None:
         texte_doc = extraire_texte_pdf(file)
-        prompt = f"[DOCUMENT JOINT]\n{texte_doc}\n\n[QUESTION]\n{message}"
+        # FIX: instruct the agent to use analyze_document only — do NOT
+        # call web_search_jort, which would add thousands of extra tokens.
+        prompt = (
+            f"[DOCUMENT JOINT — utilise analyze_document uniquement, "
+            f"ne pas appeler web_search_jort]\n{texte_doc}"
+            f"\n\n[QUESTION]\n{message}"
+        )
     else:
         prompt = message
 
@@ -58,13 +63,6 @@ def nouvelle_conversation():
 
 with gr.Blocks(title="Assistant Juridique Tunisien") as demo:
 
-    # FIX: gr.State(value=lambda: ...) does NOT call the lambda as a factory —
-    # Gradio stores the lambda object itself as the state value, meaning every
-    # user session gets the string representation of the lambda as their
-    # thread_id and they all share the same agent memory context.
-    # Fix: generate a real UUID string at startup. For true per-session
-    # isolation in multi-user deployments, regenerate it in nouvelle_conversation
-    # (already done) and on the page load event below.
     thread_id = gr.State(value=str(uuid.uuid4()))
 
     gr.Markdown("# 🏛️ Assistant Juridique Tunisien")
@@ -110,8 +108,6 @@ with gr.Blocks(title="Assistant Juridique Tunisien") as demo:
                     outputs=msg_input
                 )
 
-    # FIX: generate a fresh UUID for each new browser session so that
-    # concurrent users don't share the same LangGraph memory thread.
     demo.load(
         fn=lambda: str(uuid.uuid4()),
         outputs=[thread_id]

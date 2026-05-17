@@ -50,7 +50,7 @@ HEADERS = {
 
 BASE_9ANOUN     = "https://9anoun.tn"
 BASE_9ANOUN_FR  = "https://9anoun.tn/fr"   # French version of same content
-MAX_CONTENT_CHARS = 6000
+MAX_CONTENT_CHARS = 2000
 MIN_PARA_LEN      = 40
 
 # ── In-memory response cache ──────────────────────────────────────

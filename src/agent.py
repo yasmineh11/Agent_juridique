@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from config import LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, AGENT_MAX_ITERATIONS
 from tools import (
     search_legal_docs,
@@ -25,7 +25,8 @@ llm = ChatGroq(
     model=LLM_MODEL,
     temperature=LLM_TEMPERATURE,
     max_tokens=LLM_MAX_TOKENS,
-    api_key=os.getenv("GROQ_API_KEY")
+    api_key=os.getenv("GROQ_API_KEY"),
+    model_kwargs={"parallel_tool_calls": False},
 )
 
 # ── Outils ───────────────────────────────────────────────────────
@@ -51,31 +52,47 @@ SYSTEM_PROMPT = (
     "(7) You are not a lawyer. Answers are informational only."
 )
 
-# ── Mémoire ───────────────────────────────────────────────────────
-memory = MemorySaver()
+# ── Mémoire manuelle (fenêtre glissante) ─────────────────────────
+# We manage history manually instead of using MemorySaver so we can
+# trim it to the last N exchanges before each request — this prevents
+# the conversation from growing large enough to trigger Groq's XML
+# fallback or exceed the free-tier TPM limit.
+_histories: dict[str, list] = {}
+MAX_HISTORY_EXCHANGES = 2  # keep last 2 Q&A pairs = 4 messages
 
-# ── Agent ─────────────────────────────────────────────────────────
-# 'prompt' was renamed to 'state_modifier' in langgraph >= 0.2.x
+
+def _get_messages(thread_id: str, question: str) -> list:
+    """Build the messages list with trimmed history + new question."""
+    history = _histories.get(thread_id, [])
+    # Keep only the last MAX_HISTORY_EXCHANGES exchanges
+    trimmed = history[-(MAX_HISTORY_EXCHANGES * 2):]
+    return [SystemMessage(content=SYSTEM_PROMPT)] + trimmed + [HumanMessage(content=question)]
+
+
+def _save_exchange(thread_id: str, question: str, answer: str) -> None:
+    """Append the latest Q&A to the thread history."""
+    if thread_id not in _histories:
+        _histories[thread_id] = []
+    _histories[thread_id].append(HumanMessage(content=question))
+    _histories[thread_id].append(AIMessage(content=answer))
+
+
+# ── Agent (no checkpointer — we manage memory ourselves) ──────────
 agent_executor = create_react_agent(
     model=llm,
     tools=tools,
-    state_modifier=SYSTEM_PROMPT,
-    checkpointer=memory,
 )
 
 
 # ── Fonction principale ───────────────────────────────────────────
 def ask_agent(question: str, thread_id: str = "default") -> str:
-    config = {
-        "configurable": {"thread_id": thread_id},
-        "recursion_limit": AGENT_MAX_ITERATIONS * 3,
-    }
+    config = {"recursion_limit": AGENT_MAX_ITERATIONS * 3}
     try:
-        result = agent_executor.invoke(
-            {"messages": [HumanMessage(content=question)]},
-            config=config
-        )
-        return result["messages"][-1].content
+        messages = _get_messages(thread_id, question)
+        result = agent_executor.invoke({"messages": messages}, config=config)
+        answer = result["messages"][-1].content
+        _save_exchange(thread_id, question, answer)
+        return answer
     except Exception as e:
         return f"Erreur agent : {str(e)}"
 

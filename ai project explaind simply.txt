@@ -1,0 +1,78 @@
+our project explaind simply, layer by layer.
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+The problem in one sentence
+
+A Tunisian citizen gets fired. They don't know their rights. A lawyer costs money. The laws exist but are in Arabic, scattered across official PDFs nobody reads. **Your agent solves this.
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+What happens when a user asks a question**
+
+Say someone types: *"Quels sont mes droits en cas de licenciement ?"*
+
+The agent goes through this cycle automatically:
+
+Step 1 — Search locally first**
+It converts the question into a vector (a list of numbers representing meaning) and searches ChromaDB — your local database of Tunisian law PDFs — for the most similar legal articles. If it finds something with high confidence → it answers directly.
+
+Step 2 — If not found locally → go online**
+If the confidence is too low (CONFIANCE_FAIBLE), it scrapes 9anoun.tn — a website that hosts all Tunisian legal codes AND every JORT issue in clean HTML. It fetches the right page (e.g. Code du Travail) and uses that as context.
+
+Step 3 — LLM reads the context and answers**
+Llama 3.3 70B (running on Groq's servers) reads the legal articles found in steps 1 or 2 and writes a clear, cited answer in French or Arabic.
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+The 5 key concepts**
+
+RAG** (Retrieval-Augmented Generation) — instead of the AI answering from memory (which can be wrong), it first *retrieves* real legal text, then *generates* an answer based on that text. Like open-book exam vs closed-book.
+
+Embeddings** — a way to convert text into numbers so you can measure *semantic similarity*. "Licenciement abusif" and "rupture injustifiée du contrat" are different words but similar meanings → similar vectors → same search result.
+
+ChromaDB** — a local database that stores your law PDFs as vectors. When you run `ingest.py`, it reads all PDFs, converts them to vectors, and saves them. The agent then searches this database in milliseconds.
+
+ReAct** (Reasoning + Acting) — the agent doesn't just answer directly. It *thinks* (which tool should I use?), *acts* (calls a tool), *observes* (reads the result), then decides if it needs to act again. This loop runs up to 6 times per question.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Tools** — the 4 functions the agent can call:
+- `search_legal_docs` → searches ChromaDB
+- `web_search_jort` → scrapes 9anoun.tn
+- `analyze_document` → analyzes an uploaded PDF contract
+- `translate_legal_text` → translates Arabic ↔ French
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+The flow in one diagram**
+
+User question
+      ↓
+search_legal_docs
+      ↓
+Confidence ≥ 40%? ──Yes──→ LLM answers with citation
+      ↓ No
+web_search_jort (9anoun.tn)
+      ↓
+LLM reads scraped law + answers with citation
+```
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Why each file exists**
+
+
+| `ingest.py` | Run once — reads PDFs, creates ChromaDB |
+| `config.py` | All settings in one place |
+| `tools.py` | The 4 agent tools |
+| `scraper.py` | Fetches 9anoun.tn reliably |
+| `agent.py` | Wires LLM + tools + memory together |
+| `gradio_app.py` | The web interface users see |
+
+---
+
+That's the whole project. Want me to go deeper on any specific part — embeddings, the ReAct loop, ChromaDB, or the scraper?

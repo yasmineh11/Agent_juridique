@@ -19,7 +19,8 @@ load_dotenv()
 # ─────────────────────────────────────────────
 
 # Modèle Groq utilisé - Llama 3 70B 
-LLM_MODEL = "llama-3.1-8b-instant"
+
+LLM_MODEL = "llama-3.3-70b-versatile"
 
 # Température = créativité du modèle
 # 0.0 = déterministe (mêmes réponses aux mêmes questions)
