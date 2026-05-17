@@ -1,2 +1,6 @@
 .env
 ./src/.env
+
+__pycache__/
+*.pyc
+chroma_db/
