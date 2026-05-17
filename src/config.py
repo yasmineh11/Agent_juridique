@@ -22,6 +22,9 @@ load_dotenv()
 
 LLM_MODEL = "llama-3.3-70b-versatile"
 
+
+
+
 # Température = créativité du modèle
 # 0.0 = déterministe (mêmes réponses aux mêmes questions)
 # 1.0 = très créatif (réponses variées, moins fiables pour du droit)
@@ -30,7 +33,7 @@ LLM_TEMPERATURE = 0.1
 
 # Nombre maximum de tokens générés par réponse
 # 2048 tokens ≈ environ 1500 mots 
-LLM_MAX_TOKENS = 2048
+LLM_MAX_TOKENS = 1024
 
 # ─────────────────────────────────────────────
 # PARAMÈTRES AGENT ReAct
@@ -59,7 +62,7 @@ COLLECTION_NAME = "lois_tunisiennes"
 # Nombre de documents retournés par la recherche sémantique
 # 3 documents = bonne balance pertinence/contexte
 # Augmenter si les réponses manquent de détails, diminuer si trop verbeux
-TOP_K_RESULTS = 3
+TOP_K_RESULTS = 2
 
 # ─────────────────────────────────────────────
 # PARAMÈTRES EMBEDDINGS

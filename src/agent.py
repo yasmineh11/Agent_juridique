@@ -1,14 +1,15 @@
 # src/agent.py
 import os
 import sys
+import time
 import datetime
+import json
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from config import LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, AGENT_MAX_ITERATIONS
 from tools import (
@@ -20,77 +21,116 @@ from tools import (
 
 load_dotenv()
 
-# ── LLM ──────────────────────────────────────────────────────────
+# ── Outils ───────────────────────────────────────────────────────
+tools_by_name = {
+    "search_legal_docs":  search_legal_docs,
+    "web_search_jort":    web_search_jort,
+    "translate_legal_text": translate_legal_text,
+    "analyze_document":   analyze_document,
+}
+
+# ── LLM sans bind_tools ───────────────────────────────────────────
+# FIX: on n'utilise PAS bind_tools() — LangChain génère un format XML
+# <function=...> que llama-3.3-70b produit souvent de façon incomplète.
+# On passe les outils dans le prompt système en JSON et on parse
+# la réponse nous-mêmes.
 llm = ChatGroq(
     model=LLM_MODEL,
     temperature=LLM_TEMPERATURE,
     max_tokens=LLM_MAX_TOKENS,
     api_key=os.getenv("GROQ_API_KEY"),
-    model_kwargs={"parallel_tool_calls": False},
 )
-
-# ── Outils ───────────────────────────────────────────────────────
-tools = [
-    search_legal_docs,
-    web_search_jort,
-    translate_legal_text,
-    analyze_document
-]
 
 # ── Prompt système ────────────────────────────────────────────────
 _today = datetime.date.today().strftime("%d %B %Y")
 
-SYSTEM_PROMPT = (
-    f"You are a Tunisian legal assistant. Today: {_today}. "
-    "Always use tools. Never answer from memory alone. "
-    "Rules: (1) Always call search_legal_docs first. "
-    "(2) If it returns CONFIANCE_FAIBLE, call web_search_jort. "
-    "(3) If user uploads a document, call analyze_document first. "
-    "(4) If question is in Arabic, call translate_legal_text after searching. "
-    "(5) Always cite the exact article and source. "
-    "(6) Reply in French unless the user writes in Arabic. "
-    "(7) You are not a lawyer. Answers are informational only."
-)
+SYSTEM_PROMPT = f"""Tu es un assistant juridique tunisien. Date: {_today}.
 
-# ── Mémoire manuelle (fenêtre glissante) ─────────────────────────
-# We manage history manually instead of using MemorySaver so we can
-# trim it to the last N exchanges before each request — this prevents
-# the conversation from growing large enough to trigger Groq's XML
-# fallback or exceed the free-tier TPM limit.
+Pour répondre, tu peux appeler ces outils en écrivant exactement ce format JSON :
+TOOL_CALL: {{"tool": "nom_outil", "input": "ta requête"}}
+
+Outils disponibles :
+- search_legal_docs : recherche dans les lois tunisiennes locales (appelle EN PREMIER)
+- web_search_jort : recherche sur 9anoun.tn et le JORT (si search_legal_docs retourne CONFIANCE_FAIBLE)
+- translate_legal_text : traduit arabe↔français (format: "fr|texte arabe" ou "ar|texte français")
+- analyze_document : analyse un document juridique
+
+Règles :
+1. Appelle toujours search_legal_docs en premier
+2. Si résultat contient CONFIANCE_FAIBLE → appelle web_search_jort
+3. Si [DOCUMENT JOINT] dans le message → appelle analyze_document en premier
+4. Si question en arabe → appelle translate_legal_text après la recherche
+5. Cite toujours la source exacte
+6. Réponds en français sauf si l'utilisateur écrit en arabe
+7. Tu n'es pas avocat, tes réponses sont informatives uniquement
+
+Quand tu as toutes les informations, réponds directement sans TOOL_CALL."""
+
+# ── Mémoire manuelle ─────────────────────────────────────────────
 _histories: dict[str, list] = {}
-MAX_HISTORY_EXCHANGES = 2  # keep last 2 Q&A pairs = 4 messages
+MAX_HISTORY_EXCHANGES = 2
 
 
 def _get_messages(thread_id: str, question: str) -> list:
-    """Build the messages list with trimmed history + new question."""
     history = _histories.get(thread_id, [])
-    # Keep only the last MAX_HISTORY_EXCHANGES exchanges
     trimmed = history[-(MAX_HISTORY_EXCHANGES * 2):]
     return [SystemMessage(content=SYSTEM_PROMPT)] + trimmed + [HumanMessage(content=question)]
 
 
 def _save_exchange(thread_id: str, question: str, answer: str) -> None:
-    """Append the latest Q&A to the thread history."""
     if thread_id not in _histories:
         _histories[thread_id] = []
     _histories[thread_id].append(HumanMessage(content=question))
     _histories[thread_id].append(AIMessage(content=answer))
 
 
-# ── Agent (no checkpointer — we manage memory ourselves) ──────────
-agent_executor = create_react_agent(
-    model=llm,
-    tools=tools,
-)
+# ── Parser d'appel d'outil ────────────────────────────────────────
+def _parse_tool_call(text: str):
+    """Extrait TOOL_CALL: {...} du texte généré par le LLM."""
+    match = re.search(r'TOOL_CALL:\s*(\{.*?\})', text, re.DOTALL)
+    if not match:
+        return None, None
+    try:
+        data = json.loads(match.group(1))
+        return data.get("tool"), data.get("input", "")
+    except json.JSONDecodeError:
+        return None, None
+
+
+# ── Boucle ReAct manuelle ─────────────────────────────────────────
+def _run_agent_loop(messages: list) -> str:
+    for _ in range(AGENT_MAX_ITERATIONS):
+        response = llm.invoke(messages)
+        text = response.content
+
+        tool_name, tool_input = _parse_tool_call(text)
+
+        # Pas d'appel d'outil → réponse finale
+        if not tool_name:
+            return text
+
+        # Appel d'outil reconnu
+        if tool_name in tools_by_name:
+            print(f"  🔧 Outil: {tool_name}({tool_input[:60]}...)")
+            try:
+                result = tools_by_name[tool_name].invoke(tool_input)
+            except Exception as e:
+                result = f"Erreur outil {tool_name}: {str(e)}"
+        else:
+            result = f"Outil inconnu: {tool_name}"
+
+        # Ajoute l'échange outil dans les messages
+        messages.append(AIMessage(content=text))
+        messages.append(HumanMessage(content=f"Résultat de {tool_name}:\n{result}"))
+
+    return messages[-1].content
 
 
 # ── Fonction principale ───────────────────────────────────────────
 def ask_agent(question: str, thread_id: str = "default") -> str:
-    config = {"recursion_limit": AGENT_MAX_ITERATIONS * 3}
     try:
         messages = _get_messages(thread_id, question)
-        result = agent_executor.invoke({"messages": messages}, config=config)
-        answer = result["messages"][-1].content
+        answer = _run_agent_loop(messages)
         _save_exchange(thread_id, question, answer)
         return answer
     except Exception as e:
