@@ -18,11 +18,9 @@ load_dotenv()
 # PARAMÈTRES LLM
 # ─────────────────────────────────────────────
 
-# Modèle Groq utilisé - Llama 3 70B 
+# Modèle Groq utilisé - Llama 3 70B
 
 LLM_MODEL = "llama-3.3-70b-versatile"
-
-
 
 
 # Température = créativité du modèle

@@ -57,6 +57,31 @@ MIN_PARA_LEN      = 40
 _cache: dict[str, tuple[float, str]] = {}
 CACHE_TTL = 3600  # 1 hour
 
+# ── Session cookie bootstrap ──────────────────────────────────────
+# 9anoun.tn retourne une page de consentement cookies (129 chars)
+# si aucun cookie de session n'est présent.
+# Solution : faire une première requête sur la homepage pour collecter
+# accept_cookies + 9anoun_session, puis les réutiliser pour toutes
+# les requêtes suivantes. Les valeurs changent à chaque session donc
+# on ne les hardcode pas.
+_session_cookies: dict[str, str] = {}
+_session_bootstrapped = False
+
+
+def _bootstrap_session() -> None:
+    """Visite la homepage une fois pour collecter les cookies de session."""
+    global _session_cookies, _session_bootstrapped
+    if _session_bootstrapped:
+        return
+    try:
+        with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=10) as client:
+            client.get(BASE_9ANOUN)
+            _session_cookies = dict(client.cookies)
+            print(f"  🍪 Session initialisée ({len(_session_cookies)} cookies)")
+    except Exception as e:
+        print(f"  ✗ Bootstrap session error: {e}")
+    _session_bootstrapped = True
+
 
 def _cache_get(url: str) -> Optional[str]:
     if url in _cache:
@@ -120,19 +145,20 @@ def _extract_text(html: str) -> str:
 def _fetch(url: str, timeout: int = 10) -> Optional[str]:
     """
     Fetch a 9anoun.tn URL and return extracted text.
-    Uses a persistent httpx client with HTTP/2.
     Returns None on any error.
     """
     cached = _cache_get(url)
     if cached is not None:
         return cached
 
+    _bootstrap_session()
+
     try:
         with httpx.Client(
             headers=HEADERS,
+            cookies=_session_cookies,
             follow_redirects=True,
             timeout=timeout,
-            http2=True,
         ) as client:
             resp = client.get(url)
             resp.raise_for_status()
@@ -306,9 +332,10 @@ def fetch_9anoun_jort(keywords: str) -> tuple[str, str]:
     if cached is not None:
         index_html_raw = cached
     else:
+        _bootstrap_session()
         try:
-            with httpx.Client(headers=HEADERS, follow_redirects=True,
-                              timeout=10, http2=True) as client:
+            with httpx.Client(headers=HEADERS, cookies=_session_cookies,
+                              follow_redirects=True, timeout=10) as client:
                 resp = client.get(index_url)
                 resp.raise_for_status()
                 index_html_raw = resp.text
